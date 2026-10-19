@@ -1,432 +1,65 @@
-
-/* --- EXCEL + CSV IMPORT --- */
-
-function importHeader(value) {
-  return String(value ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "");
-}
-
-function importValue(row, headers, aliases) {
-  for (const alias of aliases) {
-    const index = headers.indexOf(importHeader(alias));
-    if (index !== -1 && row[index] !== undefined && row[index] !== null) {
-      const value = String(row[index]).trim();
-      if (value) return value;
-    }
-  }
-  return "";
-}
-
-function importDate(value) {
-  if (value === undefined || value === null || value === "") return null;
-
-  if (typeof value === "number" && window.XLSX) {
-    const parsed = XLSX.SSF.parse_date_code(value);
-    if (!parsed) return null;
-    return `${parsed.y}-${String(parsed.m).padStart(2, "0")}-${String(parsed.d).padStart(2, "0")}`;
-  }
-
-  const text = String(value).trim();
-  if (!text) return null;
-
-  // Accept ISO dates and common spreadsheet date formats.
-  const iso = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (iso) {
-    return `${iso[1]}-${iso[2].padStart(2, "0")}-${iso[3].padStart(2, "0")}`;
-  }
-
-  const parsed = new Date(text);
-  if (Number.isNaN(parsed.getTime())) return null;
-
-  return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
-}
-
-function importInterests(value) {
-  if (Array.isArray(value)) value = value.join(",");
-  const allowed = ["Apparel", "Caps", "Accessories", "All Categories"];
-  const parts = String(value || "")
-    .split(/[,;|]/)
-    .map(v => v.trim().toLowerCase());
-
-  const result = [];
-  for (const part of parts) {
-    const match = allowed.find(v => v.toLowerCase() === part);
-    if (match && !result.includes(match)) result.push(match);
-  }
-  return result;
-}
-
-function importGender(value) {
-  const v = String(value || "").trim().toLowerCase();
-  if (v === "female") return "Female";
-  if (v === "male") return "Male";
-  if (["prefer not to say", "prefer not to disclose"].includes(v)) {
-    return "Prefer not to say";
-  }
-  return null;
-}
-
-function importSource(value) {
-  const allowed = [
-    "QR", "In-store", "Instagram", "TikTok", "Facebook",
-    "Friend or Family", "Event-Booth", "Other"
-  ];
-  const v = String(value || "").trim().toLowerCase();
-  return allowed.find(x => x.toLowerCase() === v) || null;
-}
-
-function importNoteValue(note, label) {
-  const pattern = new RegExp(
-    "(?:^|\\|)\\s*" + label + "\\s*:\\s*([^|]*)",
-    "i"
-  );
-  return String(note || "").match(pattern)?.[1]?.trim() || "";
-}
-
-function findImportMatch(record) {
-  const memberNo = String(record.member_no || "").trim().toLowerCase();
-  const email = String(record.email || "").trim().toLowerCase();
-  const phone = String(record.phone || "").replace(/\s+/g, "");
-
-  if (memberNo) {
-    const matches = members.filter(
-      m => String(m.member_no || "").trim().toLowerCase() === memberNo
-    );
-    if (matches.length === 1) return { member: matches[0], reason: "Member number" };
-    if (matches.length > 1) return { ambiguous: true };
-  }
-
-  if (email) {
-    const matches = members.filter(
-      m => String(m.email || "").trim().toLowerCase() === email
-    );
-    if (matches.length === 1) return { member: matches[0], reason: "Email" };
-    if (matches.length > 1) return { ambiguous: true };
-  }
-
-  if (phone) {
-    const matches = members.filter(
-      m => String(m.phone || "").replace(/\s+/g, "") === phone
-    );
-    if (matches.length === 1) return { member: matches[0], reason: "Phone" };
-    if (matches.length > 1) return { ambiguous: true };
-  }
-
-  return { member: null };
-}
-
-function prepareImportRows(sheetRows) {
-  if (!sheetRows || sheetRows.length < 2) {
-    throw new Error("The file is empty or does not contain a header row and member data.");
-  }
-
-  const headers = sheetRows[0].map(importHeader);
-  const records = [];
-  const errors = [];
-
-  for (let i = 1; i < sheetRows.length; i++) {
-    const row = sheetRows[i];
-    if (!row || row.every(v => String(v ?? "").trim() === "")) continue;
-
-    const get = (...aliases) => importValue(row, headers, aliases);
-
-    const firstName = get("First Name", "FirstName");
-    const lastName = get("Last Name", "LastName");
-    const note = get("Note", "Notes", "Admin Notes");
-    let fullName = get("Full Name", "Member Name", "Name");
-
-    if (!fullName) fullName = `${firstName} ${lastName}`.trim();
-
-    let memberNo = get("Member No", "Member Number", "Member ID", "Member No.");
-    if (!memberNo) memberNo = importNoteValue(note, "Member number");
-
-    let pointsRaw = get("Points Balance", "Points", "Loyalty Points");
-    if (pointsRaw === "") pointsRaw = importNoteValue(note, "Points balance");
-
-    let pointsBalance = pointsRaw === "" ? 0 : Number(pointsRaw);
-    if (!Number.isInteger(pointsBalance) || pointsBalance < 0) {
-      errors.push(`Row ${i + 1}: points must be a non-negative whole number.`);
-      continue;
-    }
-
-    let dobRaw = get("Date of Birth", "DOB", "Birthday");
-    if (!dobRaw) dobRaw = importNoteValue(note, "Date of birth");
-
-    let genderRaw = get("Gender");
-    if (!genderRaw) genderRaw = importNoteValue(note, "Gender");
-
-    const phone = get(
-      "Phone", "Mobile", "Mobile Number", "Default Address Phone"
-    );
-    const email = get("Email", "Email Address");
-    const interests = importInterests(
-      get("Interests", "Product Interests", "Categories")
-    );
-
-    let notes = get("Admin Notes", "Notes");
-    if (!notes && note) {
-      notes = importNoteValue(note, "Admin notes") || note;
-    }
-
-    const record = {
-      member_no: memberNo || null,
-      full_name: fullName.trim(),
-      phone: phone.trim(),
-      email: email.trim() || null,
-      date_of_birth: importDate(dobRaw),
-      gender: importGender(genderRaw),
-      interests,
-      source: importSource(get("Source", "Discovery Source")),
-      notes: notes.trim() || null,
-      points_balance: pointsBalance,
-      sheetRow: i + 1
-    };
-
-    if (!record.full_name) {
-      errors.push(`Row ${i + 1}: missing full name.`);
-      continue;
-    }
-
-    if (!record.phone || record.phone === "—") {
-      errors.push(`Row ${i + 1}: missing phone number.`);
-      continue;
-    }
-
-    records.push(record);
-  }
-
-  if (!records.length) {
-    throw new Error(errors.length
-      ? errors.slice(0, 5).join(" ")
-      : "No valid member records were found.");
-  }
-
-  return { records, errors };
-}
-
-async function previewMemberImport(records, initialErrors) {
-  const preview = records.slice(0, 8);
-  const rowsHtml = preview.map(record => {
-    const match = findImportMatch(record);
-    let status = "New member";
-
-    if (match.ambiguous) status = "Ambiguous match — review manually";
-    else if (match.member) {
-      status = `Existing by ${match.reason}: ${match.member.full_name}`;
-    }
-
-    return `<tr>
-      <td>${record.sheetRow}</td>
-      <td>${esc(record.full_name)}</td>
-      <td>${esc(record.member_no || "Auto-generated")}</td>
-      <td>${esc(record.phone)}</td>
-      <td>${esc(record.email || "—")}</td>
-      <td>${esc(String(record.points_balance))}</td>
-      <td>${esc(status)}</td>
-    </tr>`;
-  }).join("");
-
-  const body = `
-    <p class="muted">Review the data before importing. ${records.length} valid row(s) found.</p>
-    <div class="notice">
-      ${initialErrors.length} row(s) failed validation and will not be imported.
-      ${records.length > 8 ? `Showing the first 8 of ${records.length} rows.` : ""}
-    </div>
-    <div class="field">
-      <label>How should existing members be handled?</label>
-      <select name="duplicateMode">
-        <option value="skip">Skip existing members (recommended)</option>
-        <option value="update">Update matching member profiles</option>
-      </select>
-    </div>
-    <div class="table-wrap" style="max-height:300px;overflow:auto">
-      <table>
-        <thead><tr>
-          <th>Row</th><th>Name</th><th>Member no.</th>
-          <th>Phone</th><th>Email</th><th>Points</th><th>Match status</th>
-        </tr></thead>
-        <tbody>${rowsHtml}</tbody>
-      </table>
-    </div>
-    <p class="tiny" style="margin-top:12px">
-      Existing members are matched by member number, email, then phone.
-      Ambiguous matches are always skipped. Points are adjusted through the
-      database function so changes can be recorded in points history.
-    </p>
-  `;
-
-  openModal(
-    "Preview member import",
-    body,
-    "Start import",
-    async fd => {
-      const duplicateMode = fd.get("duplicateMode");
-      const summary = {
-        added: 0,
-        updated: 0,
-        skipped: 0,
-        failed: initialErrors.length,
-        pointsWarnings: 0,
-        details: [...initialErrors]
-      };
-
-      // Detect repeated identities inside this file to avoid importing the
-      // same member twice in a single run.
-      const seen = new Set();
-
-      for (const record of records) {
-        const identity = record.member_no
-          ? `id:${record.member_no.toLowerCase()}`
-          : record.email
-            ? `email:${record.email.toLowerCase()}`
-            : `phone:${record.phone.replace(/\s+/g, "")}`;
-
-        if (seen.has(identity)) {
-          summary.skipped++;
-          summary.details.push(`Row ${record.sheetRow}: duplicate row within the file.`);
-          continue;
-        }
-        seen.add(identity);
-
-        const match = findImportMatch(record);
-
-        if (match.ambiguous) {
-          summary.skipped++;
-          summary.details.push(`Row ${record.sheetRow}: ambiguous existing-member match; skipped.`);
-          continue;
-        }
-
-        if (match.member && duplicateMode === "skip") {
-          summary.skipped++;
-          continue;
-        }
-
-        const desiredPoints = record.points_balance;
-        const payload = {
-          full_name: record.full_name,
-          phone: record.phone,
-          email: record.email,
-          date_of_birth: record.date_of_birth,
-          gender: record.gender,
-          interests: record.interests,
-          source: record.source,
-          notes: record.notes,
-          updated_at: new Date().toISOString()
-        };
-
-        let targetMember = null;
-        let isNew = false;
-
-        try {
-          if (match.member) {
-            const { error } = await client
-              .from("members")
-              .update(payload)
-              .eq("id", match.member.id);
-
-            if (error) throw error;
-            targetMember = match.member;
-            summary.updated++;
-          } else {
-            payload.member_no = record.member_no || memberNo(record.sheetRow);
-
-            const { data, error } = await client
-              .from("members")
-              .insert({ ...payload, points_balance: 0 })
-              .select("id, member_no, points_balance")
-              .single();
-
-            if (error) throw error;
-            targetMember = data;
-            isNew = true;
-            summary.added++;
-          }
-
-          const oldPoints = isNew
-            ? 0
-            : Number(targetMember.points_balance || 0);
-          const difference = desiredPoints - oldPoints;
-
-          if (difference !== 0) {
-            const { error } = await client.rpc("adjust_member_points", {
-              p_member_id: targetMember.id,
-              p_change: difference,
-              p_reason: isNew
-                ? "Opening balance imported from spreadsheet"
-                : "Points balance updated from spreadsheet import"
-            });
-
-            if (error) {
-              summary.pointsWarnings++;
-              summary.details.push(
-                `Row ${record.sheetRow}: profile saved, but points were not changed (${error.message}).`
-              );
-            }
-          }
-        } catch (error) {
-          summary.failed++;
-          summary.details.push(`Row ${record.sheetRow}: ${error.message || String(error)}`);
-        }
-      }
-
-      await loadAll();
-
-      const report = [
-        "Import finished.",
-        `Added: ${summary.added}`,
-        `Updated: ${summary.updated}`,
-        `Skipped: ${summary.skipped}`,
-        `Failed: ${summary.failed}`,
-        `Points warnings: ${summary.pointsWarnings}`
-      ];
-
-      msg(report.join(" · "), summary.failed || summary.pointsWarnings ? "error" : "success");
-
-      if (summary.details.length) {
-        const detailText = summary.details.slice(0, 12).join("\n");
-        alert(
-          report.join("\n") +
-          "\n\nDetails (up to 12):\n" + detailText
-        );
-      } else {
-        alert(report.join("\n"));
-      }
-
-      return true;
-    }
-  );
-}
-
-$("importCsvBtn").addEventListener("click", () => $("csvFileInput").click());
-
-$("csvFileInput").addEventListener("change", async event => {
-  const file = event.target.files?.[0];
-  event.target.value = "";
-  if (!file) return;
-
-  try {
-    if (!window.XLSX) {
-      throw new Error("Excel reader did not load. Refresh the page and try again.");
-    }
-
-    const buffer = await file.arrayBuffer();
-    const workbook = XLSX.read(buffer, { type: "array", cellDates: false });
-    const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-
-    if (!firstSheet) throw new Error("No worksheet found in the file.");
-
-    const rows = XLSX.utils.sheet_to_json(firstSheet, {
-      header: 1,
-      defval: "",
-      raw: true,
-      blankrows: false
-    });
-
-    const prepared = prepareImportRows(rows);
-
-    await previewMemberImport(prepared.records, prepared.errors);
-  } catch (error) {
-    msg(`Import failed: ${error.message || String(error)}`, "error");
-  }
-});
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emanmuz Membership Prototype</title><meta name="theme-color" content="#0b0b0b">
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+:root{--bg:#0b0b0b;--panel:#141414;--panel2:#1b1b1b;--gold:#d6b46a;--gold2:#f0d99a;--text:#f5f1e8;--muted:#a6a096;--line:#302b20;--red:#f08a83;--green:#8bd4a8;--radius:18px}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 80% -10%,#302719 0,transparent 36%),var(--bg);color:var(--text);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer}.hidden{display:none!important}.muted{color:var(--muted)}.gold{color:var(--gold)}.wrap{max-width:1250px;margin:auto;padding:28px}.brand{display:flex;align-items:center;gap:13px}.mark{width:46px;height:46px;border:1px solid var(--gold);color:var(--gold);border-radius:14px;display:grid;place-items:center;font-family:Georgia,serif;font-size:21px;letter-spacing:-2px}.brand h1{font-size:17px;margin:0;letter-spacing:.12em;text-transform:uppercase}.brand p{margin:2px 0 0;color:var(--muted);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.topbar{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:34px}.eyebrow{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--gold);font-weight:700}.hero{margin-bottom:26px}.hero h2{font-size:clamp(27px,4vw,40px);line-height:1.1;letter-spacing:-.04em;margin:8px 0}.hero p{color:var(--muted);margin:0}.card{background:linear-gradient(145deg,#181818,#111);border:1px solid var(--line);border-radius:var(--radius);padding:22px}.login{max-width:450px;margin:8vh auto}.login h2{margin:8px 0 4px;font-size:28px}.field{display:flex;flex-direction:column;gap:7px;margin:14px 0}.field label{font-size:12px;color:#c9c2b4;font-weight:650}.field input,.field select,.field textarea,.search{width:100%;border:1px solid #38342b;border-radius:11px;background:#0d0d0d;color:var(--text);padding:12px 13px;outline:none}.field input:focus,.field select:focus,.field textarea:focus,.search:focus{border-color:var(--gold)}.btn{border:1px solid var(--gold);border-radius:11px;background:var(--gold);color:#17130a;padding:10px 15px;font-weight:750}.btn:hover{background:var(--gold2)}.btn.secondary{background:transparent;color:var(--gold)}.btn.ghost{background:transparent;border-color:#3b362c;color:var(--text)}.btn.danger{background:transparent;border-color:#70423e;color:var(--red)}.btn.small{padding:7px 10px;font-size:12px;border-radius:9px}.btn:disabled{opacity:.5;cursor:not-allowed}.notice{margin:12px 0;padding:11px 13px;border-radius:10px;background:#241f14;border:1px solid #5b4a28;color:var(--gold2);font-size:13px}.error{color:var(--red)}.success{color:var(--green)}.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.toolbar .search{flex:1;min-width:190px}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:20px 0}.stat .label{color:var(--muted);font-size:12px}.stat .value{font-size:29px;font-weight:750;letter-spacing:-.04em;margin-top:7px}.stat .sub{font-size:12px;color:var(--gold);margin-top:3px}.layout{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(300px,.8fr);gap:18px}.section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:16px}.section-head h3{margin:0;font-size:17px}.member-list{display:flex;flex-direction:column;gap:9px}.member{display:flex;align-items:center;gap:13px;padding:13px;border:1px solid #2c2923;border-radius:13px;background:#111;cursor:pointer}.member:hover,.member.selected{border-color:#8c713d;background:#1b1812}.avatar{width:40px;height:40px;flex:0 0 40px;border-radius:12px;display:grid;place-items:center;background:#2b2417;color:var(--gold2);font-weight:800}.member-main{min-width:0;flex:1}.member-select{width:17px;height:17px;accent-color:var(--gold);flex:0 0 auto}.export-tools{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:0 0 14px}.export-tools .tiny{margin-right:auto}.member-name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.member-meta{color:var(--muted);font-size:12px;overflow-wrap:anywhere}.points{text-align:right;white-space:nowrap}.points strong{display:block;color:var(--gold2);font-size:18px}.points span{color:var(--muted);font-size:11px}.empty{padding:28px;text-align:center;border:1px dashed #393328;border-radius:13px;color:var(--muted)}.pill{display:inline-flex;padding:4px 8px;border-radius:100px;font-size:11px;font-weight:750;letter-spacing:.02em}.pill.active{background:#193426;color:#9ee1b9}.pill.used{background:#33251f;color:#e6b4a0}.details{min-height:250px}.detail-title{font-size:23px;font-weight:750;letter-spacing:-.03em;margin:4px 0}.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin:20px 0}.detail-item{min-width:0}.detail-item .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.1em}.detail-item .v{margin-top:4px;overflow-wrap:anywhere}.tabs{display:flex;gap:6px;margin:18px 0;flex-wrap:wrap}.tab{border:1px solid #393328;background:transparent;color:var(--muted);border-radius:10px;padding:8px 11px}.tab.active{border-color:var(--gold);color:var(--gold2);background:#211b10}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:11px 8px;border-bottom:1px solid #2a2721;vertical-align:top}th{color:var(--muted);font-weight:650;font-size:11px;text-transform:uppercase;letter-spacing:.08em}td{overflow-wrap:anywhere}.footer{padding:25px 0 8px;text-align:center;color:#716c61;font-size:11px;letter-spacing:.1em;text-transform:uppercase}.inline-form{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}.inline-form .full{grid-column:1/-1}.checkrow{display:flex;gap:9px;align-items:center;color:var(--muted);font-size:13px;flex-wrap:wrap}.checkrow label{display:flex;gap:6px;align-items:center}.modal-backdrop{position:fixed;inset:0;background:#000b;display:grid;place-items:center;padding:18px;z-index:10}.modal{width:min(850px,100%);max-height:90vh;overflow:auto;background:#151515;border:1px solid #4a402d;border-radius:18px;padding:23px;box-shadow:0 24px 80px #0009}.modal h3{margin:0 0 4px}.modal-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:18px}.right-actions{display:flex;gap:8px;flex-wrap:wrap}.tiny{font-size:11px;color:var(--muted)}@media(max-width:850px){.layout{grid-template-columns:1fr}.stats{grid-template-columns:1fr 1fr}.stats .stat:last-child{grid-column:1/-1}}@media(max-width:520px){.wrap{padding:16px}.topbar{align-items:flex-start}.brand h1{font-size:14px}.stats{gap:8px}.stat .value{font-size:24px}.card{padding:16px}.inline-form{grid-template-columns:1fr}.inline-form .full{grid-column:auto}.detail-grid{gap:10px}.topbar .btn{padding:8px 10px;font-size:12px}}
+</style>
+</head>
+<body><div class="wrap">
+<header class="topbar"><div class="brand"><div class="mark">em</div><div><h1>emanmuz</h1><p>Membership Prototype</p></div></div><button id="logoutBtn" class="btn secondary hidden">Log out</button></header>
+<main><section id="loginView" class="card login"><div class="eyebrow">Private administration</div><h2>Welcome back.</h2><p class="muted">Sign in to manage your members, points and rewards.</p><form id="loginForm"><div class="field"><label for="loginEmail">Email address</label><input id="loginEmail" type="email" autocomplete="username" required placeholder="admin@example.com"></div><div class="field"><label for="loginPassword">Password</label><input id="loginPassword" type="password" autocomplete="current-password" required placeholder="Your password"></div><button class="btn" style="width:100%" type="submit">Sign in securely</button></form><div id="loginMsg" class="notice hidden" role="status"></div><p class="tiny">Admin access only · No public registration</p></section>
+<section id="appView" class="hidden"><div class="hero"><div class="eyebrow">Member operations / 001</div><h2>Membership, <span class="gold">made simple.</span></h2><p>Manage member profiles, loyalty points and vouchers from one place.</p></div><div id="globalMsg" class="notice hidden" role="status"></div>
+<div class="stats"><div class="card stat"><div class="label">Total members</div><div id="totalMembers" class="value">—</div><div class="sub">Registered members</div></div><div class="card stat"><div class="label">Points issued</div><div id="totalPoints" class="value">—</div><div class="sub">Current balances combined</div></div><div class="card stat"><div class="label">Active vouchers</div><div id="activeVouchers" class="value">—</div><div class="sub">Available to redeem</div></div></div>
+<div class="layout"><section class="card"><div class="section-head"><h3>Members</h3><div style="display:flex;gap:6px;flex-wrap:wrap"><button id="importCsvBtn" class="btn secondary small">Import Excel / CSV</button><button id="addMemberBtn" class="btn small">+ Add member</button></div></div><div class="toolbar" style="margin-bottom:14px"><input id="memberSearch" class="search" placeholder="Search name, member ID, phone or email…" aria-label="Search members"><button id="refreshBtn" class="btn ghost small">Refresh</button></div><div class="export-tools"><label class="checkrow"><input id="selectFilteredMembers" type="checkbox"> Select all filtered</label><span id="selectionCount" class="tiny">0 selected</span><button id="exportSelectedBtn" class="btn secondary small" disabled>Export selected CSV</button><button id="exportFilteredBtn" class="btn small">Export filtered CSV</button></div><div class="tiny" style="margin:-5px 0 12px">Shopify customer CSV · opens in Excel · points and membership details are included in Notes</div><div id="memberList" class="member-list"><div class="empty">Loading members…</div></div></section>
+<section class="card details"><div class="section-head"><h3>Member profile</h3><span class="eyebrow">Selected</span></div><div id="profileEmpty" class="empty">Select a member to view their profile, adjust points or manage vouchers.</div><div id="profileContent" class="hidden"></div></section></div>
+<section class="card" style="margin-top:18px"><div class="section-head"><div><h3>Recent points activity</h3><div class="tiny">Latest recorded adjustments</div></div><button id="refreshHistoryBtn" class="btn ghost small">Refresh history</button></div><div id="historyTable" class="table-wrap"><div class="empty">Select refresh to load activity.</div></div></section></section></main>
+<footer class="footer">emanmuz · Private membership administration · Prototype</footer></div>
+<input type="file" id="csvFileInput" accept=".csv,.xlsx,.xls" class="hidden"><div id="modalRoot"></div>
+<script>
+const SUPABASE_URL='https://jtzztcokpfepybklhfto.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY='sb_publishable_or5uFImQ-jAFrGtSfEHK9Q_gfIvBhaW';
+const client=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY);
+const $=id=>document.getElementById(id);let members=[],selectedId=null,vouchers=[],history=[],activeTab='vouchers';const selectedMemberIds=new Set();
+const esc=(s='')=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dateFmt=s=>s?new Date(s).toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'}):'—';const dateTimeFmt=s=>s?new Date(s).toLocaleString(undefined,{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+function msg(text,type='notice',target='globalMsg'){const el=$(target);el.textContent=text;el.className='notice '+(type==='error'?'error':type==='success'?'success':'');el.classList.remove('hidden')}function clearMsg(target='globalMsg'){const el=$(target);el.classList.add('hidden');el.textContent=''}
+function categoryOptions(selected=[]){return ['Apparel','Caps','Accessories','All Categories'].map(x=>`<label><input type="checkbox" name="interests" value="${x}" ${selected.includes(x)?'checked':''}> ${x}</label>`).join('')}
+function memberNo(index=0){return 'EM-'+(Date.now()+index).toString().slice(-8)}
+async function boot(){const {data:{session}}=await client.auth.getSession();setAuthView(!!session);if(session)await loadAll()}function setAuthView(inApp){$('loginView').classList.toggle('hidden',inApp);$('appView').classList.toggle('hidden',!inApp);$('logoutBtn').classList.toggle('hidden',!inApp)}
+$('loginForm').addEventListener('submit',async e=>{e.preventDefault();clearMsg('loginMsg');const btn=e.submitter;btn.disabled=true;btn.textContent='Signing in…';const {error}=await client.auth.signInWithPassword({email:$('loginEmail').value.trim(),password:$('loginPassword').value});btn.disabled=false;btn.textContent='Sign in securely';if(error){msg(error.message,'error','loginMsg');return}setAuthView(true);await loadAll()});$('logoutBtn').addEventListener('click',async()=>{await client.auth.signOut();setAuthView(false);selectedId=null});client.auth.onAuthStateChange((_event,session)=>setAuthView(!!session));
+async function loadAll(){clearMsg();const [m,v]=await Promise.all([client.from('members').select('*').order('created_at',{ascending:false}),client.from('vouchers').select('*').order('issued_at',{ascending:false})]);if(m.error||v.error){msg((m.error||v.error).message,'error');return}members=m.data||[];vouchers=v.data||[];renderMembers();renderStats();if(selectedId&&!members.some(x=>x.id===selectedId))selectedId=null;if(selectedId)await renderProfile();await loadHistory()}
+function renderStats(){$('totalMembers').textContent=members.length.toLocaleString();$('totalPoints').textContent=members.reduce((a,m)=>a+(Number(m.points_balance)||0),0).toLocaleString();$('activeVouchers').textContent=vouchers.filter(v=>v.status==='Active').length.toLocaleString()}
+function filteredMembers(){const q=$('memberSearch').value.trim().toLowerCase();return members.filter(m=>[m.full_name,m.member_no,m.phone,m.email].some(v=>String(v||'').toLowerCase().includes(q)))}
+function renderMembers(){const list=filteredMembers();$('memberList').innerHTML=list.length?list.map(m=>`<div class="member ${m.id===selectedId?'selected':''}" data-id="${m.id}"><input class="member-select" type="checkbox" aria-label="Select ${esc(m.full_name)} for export" data-select-member="${m.id}" ${selectedMemberIds.has(m.id)?'checked':''}><div class="avatar">${esc((m.full_name||'?').trim().slice(0,1).toUpperCase())}</div><div class="member-main"><div class="member-name">${esc(m.full_name)}</div><div class="member-meta">${esc(m.member_no)} · ${esc(m.phone)}</div></div><div class="points"><strong>${Number(m.points_balance||0).toLocaleString()}</strong><span>POINTS</span></div></div>`).join(''):'<div class="empty">No members found. Add your first member to get started.</div>';document.querySelectorAll('.member').forEach(el=>el.addEventListener('click',e=>{if(e.target.closest('[data-select-member]'))return;selectMember(el.dataset.id)}));document.querySelectorAll('[data-select-member]').forEach(cb=>cb.addEventListener('change',e=>{e.stopPropagation();if(cb.checked)selectedMemberIds.add(cb.dataset.selectMember);else selectedMemberIds.delete(cb.dataset.selectMember);updateExportControls()}));updateExportControls()}
+function updateExportControls(){const filtered=filteredMembers(),visible=filtered.filter(m=>selectedMemberIds.has(m.id));$('selectionCount').textContent=`${selectedMemberIds.size} selected`;$('exportSelectedBtn').disabled=selectedMemberIds.size===0;$('selectFilteredMembers').checked=filtered.length>0&&visible.length===filtered.length;$('selectFilteredMembers').indeterminate=visible.length>0&&visible.length<filtered.length;$('exportFilteredBtn').disabled=filtered.length===0}
+$('memberSearch').addEventListener('input',renderMembers);$('refreshBtn').addEventListener('click',loadAll);$('refreshHistoryBtn').addEventListener('click',loadHistory);$('selectFilteredMembers').addEventListener('change',()=>{const list=filteredMembers();if($('selectFilteredMembers').checked)list.forEach(m=>selectedMemberIds.add(m.id));else list.forEach(m=>selectedMemberIds.delete(m.id));renderMembers()});$('exportSelectedBtn').addEventListener('click',()=>exportShopifyCsv(members.filter(m=>selectedMemberIds.has(m.id)),'selected'));$('exportFilteredBtn').addEventListener('click',()=>exportShopifyCsv(filteredMembers(),'filtered'));
+/* Excel/CSV import */
+const normHeader=v=>String(v??'').toLowerCase().replace(/[^a-z0-9]/g,'');
+function getImportValue(row,headers,aliases){for(const alias of aliases){const idx=headers.indexOf(normHeader(alias));if(idx!==-1&&row[idx]!==undefined&&row[idx]!==null&&String(row[idx]).trim()!=='')return row[idx]}return ''}
+function importDate(v){if(v===null||v===undefined||v==='')return null;if(typeof v==='number'){const d=XLSX.SSF.parse_date_code(v);if(!d)return null;return `${d.y}-${String(d.m).padStart(2,'0')}-${String(d.d).padStart(2,'0')}`}const s=String(v).trim();const iso=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);if(iso)return `${iso[1]}-${iso[2].padStart(2,'0')}-${iso[3].padStart(2,'0')}`;const d=new Date(s);if(Number.isNaN(d.getTime()))return null;return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`}
+function noteExtract(note,label){const re=new RegExp('(?:^|\\|)\\s*'+label+'\\s*:\\s*([^|]*)','i');return String(note||'').match(re)?.[1]?.trim()||''}
+function parseInterests(v){const allowed=['Apparel','Caps','Accessories','All Categories'];return [...new Set(String(v||'').split(/[,;|]/).map(x=>allowed.find(a=>a.toLowerCase()===x.trim().toLowerCase())).filter(Boolean))]}
+function parseGender(v){const s=String(v||'').trim().toLowerCase();if(s==='male')return'Male';if(s==='female')return'Female';if(s==='prefer not to say')return'Prefer not to say';return null}
+function parseSource(v){const allowed=['QR','In-store','Instagram','TikTok','Facebook','Friend or Family','Event-Booth','Other'];return allowed.find(x=>x.toLowerCase()===String(v||'').trim().toLowerCase())||null}
+function prepareRows(sheetRows){if(!sheetRows||sheetRows.length<2)throw Error('The file must contain a header row and at least one member row.');const headers=sheetRows[0].map(normHeader),records=[],errors=[];for(let i=1;i<sheetRows.length;i++){const row=sheetRows[i];if(!row||row.every(v=>String(v??'').trim()===''))continue;const get=(...a)=>getImportValue(row,headers,a);const first=String(get('First Name','FirstName')||'').trim(),last=String(get('Last Name','LastName')||'').trim(),shopNote=String(get('Note','Shopify Note')||'');const name=String(get('Full Name','Member Name','Name')||`${first} ${last}`).trim();let member_no=String(get('Member No','Member Number','Member ID')||noteExtract(shopNote,'Member number')).trim()||null;const phone=String(get('Phone','Mobile','Mobile Number','Default Address Phone')||'').trim();const email=String(get('Email','Email Address')||'').trim()||null;let pointsRaw=get('Points Balance','Points','Loyalty Points');if(pointsRaw===''||pointsRaw===null)pointsRaw=noteExtract(shopNote,'Points balance')||0;const points_balance=Number(pointsRaw);if(!name){errors.push(`Row ${i+1}: missing full name.`);continue}if(!phone||phone==='—'){errors.push(`Row ${i+1}: missing phone number.`);continue}if(!Number.isInteger(points_balance)||points_balance<0){errors.push(`Row ${i+1}: points must be a non-negative whole number.`);continue}let dob=get('Date of Birth','DOB','Birthday')||noteExtract(shopNote,'Date of birth');const gender=get('Gender')||noteExtract(shopNote,'Gender');const interests=get('Interests','Product Interests','Categories');const notes=String(get('Admin Notes','Notes')||noteExtract(shopNote,'Admin notes')||shopNote||'').trim()||null;records.push({sheetRow:i+1,member_no,full_name:name,phone,email,date_of_birth:importDate(dob),gender:parseGender(gender),interests:parseInterests(interests),source:parseSource(get('Source','Discovery Source')),notes,points_balance})}if(!records.length)throw Error(errors.slice(0,5).join(' ')||'No valid member rows found.');return{records,errors}}
+function findMatch(r){const checks=[['member_no',String(r.member_no||'').trim().toLowerCase(),m=>String(m.member_no||'').trim().toLowerCase()],['email',String(r.email||'').trim().toLowerCase(),m=>String(m.email||'').trim().toLowerCase()],['phone',String(r.phone||'').replace(/\s/g,''),m=>String(m.phone||'').replace(/\s/g,'')]];for(const [field,value,getter]of checks){if(!value)continue;const found=members.filter(m=>getter(m)===value);if(found.length===1)return{member:found[0],reason:field};if(found.length>1)return{ambiguous:true}}return{member:null}}
+$('importCsvBtn').addEventListener('click',()=>$('csvFileInput').click());$('csvFileInput').addEventListener('change',async e=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;try{if(!window.XLSX)throw Error('Excel reader did not load. Refresh the page and try again.');const wb=XLSX.read(await file.arrayBuffer(),{type:'array',cellDates:false});const sheet=wb.Sheets[wb.SheetNames[0]];if(!sheet)throw Error('No worksheet found.');const rows=XLSX.utils.sheet_to_json(sheet,{header:1,defval:'',raw:true,blankrows:false});const parsed=prepareRows(rows);showImportPreview(parsed.records,parsed.errors,file.name)}catch(err){msg('Import failed: '+(err.message||String(err)),'error')}});
+function showImportPreview(records,errors,filename){const sample=records.slice(0,10).map(r=>{const m=findMatch(r);const status=m.ambiguous?'Ambiguous match — will skip':m.member?`Existing (${m.reason})`:'New';return `<tr><td>${r.sheetRow}</td><td>${esc(r.full_name)}</td><td>${esc(r.member_no||'Auto-generated')}</td><td>${esc(r.phone)}</td><td>${esc(r.email||'—')}</td><td>${r.points_balance}</td><td>${esc(status)}</td></tr>`}).join('');const body=`<p class="muted">File: ${esc(filename)} · ${records.length} valid row(s)</p><div class="notice">${errors.length} row(s) have validation errors and will not be imported. Preview shows up to 10 rows.</div><div class="field"><label>Existing members</label><select name="duplicateMode"><option value="skip">Skip existing (recommended)</option><option value="update">Update matching profile and points balance</option></select></div><div class="table-wrap" style="max-height:340px;overflow:auto"><table><thead><tr><th>Row</th><th>Name</th><th>Member No.</th><th>Phone</th><th>Email</th><th>Points</th><th>Status</th></tr></thead><tbody>${sample}</tbody></table></div><p class="tiny">Matches are checked by member number, email, then phone. Ambiguous matches are skipped. Point changes require the adjust_member_points database function.</p>`;openModal('Preview import',body,'Import members',async fd=>{const mode=fd.get('duplicateMode'),summary={added:0,updated:0,skipped:0,failed:errors.length,pointsWarnings:0,details:[...errors]},seen=new Set();for(const r of records){const key=r.member_no?'id:'+r.member_no.toLowerCase():r.email?'email:'+r.email.toLowerCase():'phone:'+r.phone.replace(/\s/g,'');if(seen.has(key)){summary.skipped++;summary.details.push(`Row ${r.sheetRow}: repeated identity in this file.`);continue}seen.add(key);const match=findMatch(r);if(match.ambiguous){summary.skipped++;summary.details.push(`Row ${r.sheetRow}: ambiguous match; skipped.`);continue}if(match.member&&mode==='skip'){summary.skipped++;continue}const payload={full_name:r.full_name,phone:r.phone,email:r.email,date_of_birth:r.date_of_birth,gender:r.gender,interests:r.interests,source:r.source,notes:r.notes,updated_at:new Date().toISOString()};let target=null,isNew=false;try{if(match.member){const {error}=await client.from('members').update(payload).eq('id',match.member.id);if(error)throw error;target=match.member;summary.updated++}else{payload.member_no=r.member_no||memberNo(r.sheetRow);const {data,error}=await client.from('members').insert({...payload,points_balance:0}).select('id,member_no,points_balance').single();if(error)throw error;target=data;isNew=true;summary.added++}const difference=r.points_balance-(isNew?0:Number(target.points_balance||0));if(difference!==0){const {error}=await client.rpc('adjust_member_points',{p_member_id:target.id,p_change:difference,p_reason:isNew?'Opening balance imported from spreadsheet':'Points balance updated from spreadsheet import'});if(error){summary.pointsWarnings++;summary.details.push(`Row ${r.sheetRow}: profile saved, points unchanged: ${error.message}`)}}}catch(err){summary.failed++;summary.details.push(`Row ${r.sheetRow}: ${err.message||String(err)}`)}}await loadAll();const report=`Import finished.\nAdded: ${summary.added}\nUpdated: ${summary.updated}\nSkipped: ${summary.skipped}\nFailed: ${summary.failed}\nPoints warnings: ${summary.pointsWarnings}`;msg(report.replace(/\n/g,' · '),summary.failed||summary.pointsWarnings?'error':'success');alert(report+(summary.details.length?'\n\nDetails (first 15):\n'+summary.details.slice(0,15).join('\n'):''));return true})}
+function csvCell(value,protectFormula=true){let s=String(value??'');if(protectFormula&&/^[\s]*[=+@\-]/.test(s))s="'"+s;return '"'+s.replace(/"/g,'""')+'"'}
+function exportShopifyCsv(rows,mode){if(!rows.length){msg('No members to export.','error');return}const headers=['First Name','Last Name','Email','Accepts Email Marketing','Default Address Company','Default Address Address1','Default Address Address2','Default Address City','Default Address Province Code','Default Address Country Code','Default Address Zip','Default Address Phone','Phone','Accepts SMS Marketing','Accepts WhatsApp Marketing','Total Spent','Total Orders','Note','Tax Exempt','Tags'],lines=[headers];for(const m of rows){const name=String(m.full_name||'').trim().split(/\s+/).filter(Boolean),first=name.shift()||'',last=name.join(' '),note=[`Member number: ${m.member_no||''}`,`Points balance: ${Number(m.points_balance||0)}`,`Date of birth: ${m.date_of_birth||''}`,`Gender: ${m.gender||''}`,`Admin notes: ${m.notes||''}`].join(' | ');lines.push([first,last,m.email||'','no','','','','','','','','',m.phone||'','no','no','','',note,'no','emanmuz-member'])}const csv='\uFEFF'+lines.map(row=>row.map((v,i)=>csvCell(v,i!==12)).join(',')).join('\r\n'),blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=`emanmuz-shopify-customers-${mode}-${new Date().toISOString().slice(0,10)}.csv`;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);msg(`Exported ${rows.length} member(s) to Shopify-compatible CSV. Marketing consent is set to “no”.`,'success')}
+async function selectMember(id){selectedId=id;renderMembers();activeTab='vouchers';await renderProfile();await loadHistory()}
+async function renderProfile(){const m=members.find(x=>x.id===selectedId);if(!m){$('profileEmpty').classList.remove('hidden');$('profileContent').classList.add('hidden');return}const {data:vs,error}=await client.from('vouchers').select('*').eq('member_id',m.id).order('issued_at',{ascending:false});if(error){msg(error.message,'error');return}const {data:txs}=await client.from('points_transactions').select('*').eq('member_id',m.id).order('created_at',{ascending:false}).limit(8);$('profileEmpty').classList.add('hidden');$('profileContent').classList.remove('hidden');const interests=(m.interests||[]).join(', ')||'—';$('profileContent').innerHTML=`<div class="eyebrow">${esc(m.member_no)}</div><div class="detail-title">${esc(m.full_name)}</div><div class="member-meta">Member since ${dateFmt(m.created_at)}</div><div class="detail-grid"><div class="detail-item"><div class="k">Points balance</div><div class="v gold" style="font-size:25px;font-weight:800">${Number(m.points_balance||0).toLocaleString()}</div></div><div class="detail-item"><div class="k">Phone</div><div class="v">${esc(m.phone)}</div></div><div class="detail-item"><div class="k">Email</div><div class="v">${esc(m.email||'—')}</div></div><div class="detail-item"><div class="k">Date of birth</div><div class="v">${dateFmt(m.date_of_birth)}</div></div><div class="detail-item"><div class="k">Gender</div><div class="v">${esc(m.gender||'—')}</div></div><div class="detail-item"><div class="k">Interests</div><div class="v">${esc(interests)}</div></div><div class="detail-item"><div class="k">Discovery source</div><div class="v">${esc(m.source||'—')}</div></div><div class="detail-item"><div class="k">Notes</div><div class="v">${esc(m.notes||'—')}</div></div></div><div class="right-actions"><button class="btn small" id="adjustPointsBtn">± Adjust points</button><button class="btn secondary small" id="issueVoucherBtn">+ Issue voucher</button><button class="btn ghost small" id="editMemberBtn">Edit profile</button></div><div class="tabs"><button class="tab ${activeTab==='vouchers'?'active':''}" data-tab="vouchers">Vouchers (${(vs||[]).length})</button><button class="tab ${activeTab==='points'?'active':''}" data-tab="points">Points history (${(txs||[]).length})</button></div><div id="profileTabContent">${activeTab==='vouchers'?renderVouchers(vs||[]):renderTransactions(txs||[])}</div>`;$('adjustPointsBtn').onclick=()=>openPointsModal(m);$('issueVoucherBtn').onclick=()=>openVoucherModal(m);$('editMemberBtn').onclick=()=>openMemberModal(m);document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=async()=>{activeTab=b.dataset.tab;await renderProfile()});document.querySelectorAll('[data-use-voucher]').forEach(b=>b.onclick=()=>markVoucherUsed(b.dataset.useVoucher))}
+function renderVouchers(vs){return vs.length?`<div class="table-wrap"><table><thead><tr><th>Voucher</th><th>Reward</th><th>Status</th><th></th></tr></thead><tbody>${vs.map(v=>`<tr><td><strong>${esc(v.code)}</strong><div class="tiny">${dateFmt(v.issued_at)}</div></td><td>${esc(v.reward)}${v.expiry_date?`<div class="tiny">Expires ${dateFmt(v.expiry_date)}</div>`:''}</td><td><span class="pill ${v.status==='Used'?'used':'active'}">${esc(v.status)}</span></td><td>${v.status==='Active'?`<button class="btn ghost small" data-use-voucher="${v.id}">Mark used</button>`:''}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No vouchers issued to this member yet.</div>'}
+function renderTransactions(txs){return txs.length?`<div class="table-wrap"><table><thead><tr><th>Date</th><th>Change</th><th>Reason</th></tr></thead><tbody>${txs.map(t=>`<tr><td>${dateTimeFmt(t.created_at)}</td><td class="${t.points_change>0?'success':'error'}">${t.points_change>0?'+':''}${t.points_change}</td><td>${esc(t.reason)}</td></tr>`).join('')}</tbody></table></div>`:'<div class="empty">No points adjustments recorded yet.</div>'}
+async function loadHistory(){const {data,error}=await client.from('points_transactions').select('id,member_id,points_change,reason,created_at').order('created_at',{ascending:false}).limit(12);if(error){$('historyTable').innerHTML=`<div class="empty">${esc(error.message)}</div>`;return}history=data||[];$('historyTable').innerHTML=history.length?`<table><thead><tr><th>Date</th><th>Member</th><th>Change</th><th>Reason</th></tr></thead><tbody>${history.map(t=>{const m=members.find(x=>x.id===t.member_id);return `<tr><td>${dateTimeFmt(t.created_at)}</td><td>${esc(m?.full_name||'Member')}</td><td class="${t.points_change>0?'success':'error'}">${t.points_change>0?'+':''}${t.points_change}</td><td>${esc(t.reason)}</td></tr>`}).join('')}</tbody></table>`:'<div class="empty">No points activity yet.</div>'}
+function openModal(title,body,submitLabel,onSubmit){$('modalRoot').innerHTML=`<div class="modal-backdrop" id="modalBackdrop"><section class="modal" role="dialog" aria-modal="true"><div class="section-head"><div><div class="eyebrow">emanmuz / admin</div><h3>${title}</h3></div><button class="btn ghost small" id="closeModalBtn" type="button">Close</button></div><form id="modalForm">${body}<div id="modalMsg" class="notice hidden"></div><div class="modal-actions"><button type="button" id="cancelModalBtn" class="btn ghost">Cancel</button><button type="submit" class="btn">${submitLabel}</button></div></form></section></div>`;const close=()=>{$('modalRoot').innerHTML=''};$('closeModalBtn').onclick=close;$('cancelModalBtn').onclick=close;$('modalBackdrop').addEventListener('click',e=>{if(e.target.id==='modalBackdrop')close()});$('modalForm').addEventListener('submit',async e=>{e.preventDefault();const btn=e.submitter;btn.disabled=true;try{if(await onSubmit(new FormData(e.currentTarget)))close()}catch(err){$('modalMsg').textContent=err.message||String(err);$('modalMsg').className='notice error'}finally{if(btn.isConnected)btn.disabled=false}})}
+function openMemberModal(m=null){const x=m||{};openModal(m?'Edit member profile':'Register a member',`<div class="inline-form"><div class="field full"><label>Full name *</label><input name="full_name" required value="${esc(x.full_name||'')}"></div><div class="field"><label>Phone *</label><input name="phone" required value="${esc(x.phone||'')}"></div><div class="field"><label>Email</label><input name="email" type="email" value="${esc(x.email||'')}"></div><div class="field"><label>Date of birth</label><input name="date_of_birth" type="date" value="${esc(x.date_of_birth||'')}"></div><div class="field"><label>Gender</label><select name="gender"><option value="">Choose…</option>${['Female','Male','Prefer not to say'].map(v=>`<option ${x.gender===v?'selected':''}>${v}</option>`).join('')}</select></div><div class="field full"><label>Product interests</label><div class="checkrow">${categoryOptions(x.interests||[])}</div></div><div class="field"><label>Discovery source</label><select name="source"><option value="">Choose…</option>${['QR','In-store','Instagram','TikTok','Facebook','Friend or Family','Event-Booth','Other'].map(v=>`<option ${x.source===v?'selected':''}>${v}</option>`).join('')}</select></div><div class="field"><label>Admin notes</label><input name="notes" value="${esc(x.notes||'')}"></div></div>`,m?'Save changes':'Register member',async fd=>{const payload={full_name:String(fd.get('full_name')).trim(),phone:String(fd.get('phone')).trim(),email:String(fd.get('email')||'').trim()||null,date_of_birth:fd.get('date_of_birth')||null,gender:fd.get('gender')||null,interests:fd.getAll('interests'),source:fd.get('source')||null,notes:String(fd.get('notes')||'').trim()||null,updated_at:new Date().toISOString()};if(m){const {error}=await client.from('members').update(payload).eq('id',m.id);if(error)throw error;selectedId=m.id;msg('Member profile updated.','success')}else{payload.member_no=memberNo();const {data,error}=await client.from('members').insert(payload).select('id').single();if(error)throw error;selectedId=data.id;msg('Member registered successfully.','success')}await loadAll();return true})}
+function openPointsModal(m){openModal('Adjust loyalty points',`<div class="notice">Current balance: <strong>${Number(m.points_balance||0)}</strong> points. Use a positive number to add points or a negative number to deduct points.</div><div class="field"><label>Points change *</label><input name="change" type="number" step="1" required placeholder="e.g. 10 or -5"></div><div class="field"><label>Reason *</label><input name="reason" required maxlength="250" placeholder="e.g. Purchase at event booth"></div>`,'Save adjustment',async fd=>{const change=Number(fd.get('change')),reason=String(fd.get('reason')||'').trim();if(!Number.isInteger(change)||change===0)throw Error('Enter a non-zero whole number of points.');if(!reason)throw Error('Please enter a reason.');const {error}=await client.rpc('adjust_member_points',{p_member_id:m.id,p_change:change,p_reason:reason});if(error)throw error;msg('Points updated and transaction recorded.','success');await loadAll();return true})}
+function openVoucherModal(m){openModal('Issue a voucher',`<div class="field"><label>Voucher code *</label><input name="code" required maxlength="80" value="EM-${Math.random().toString(36).slice(2,8).toUpperCase()}" placeholder="e.g. EM-GOLD10"></div><div class="field"><label>Reward *</label><input name="reward" required maxlength="180" placeholder="e.g. RM10 off next purchase"></div><div class="field"><label>Expiry date (optional)</label><input name="expiry_date" type="date"></div><div class="field"><label>Notes (optional)</label><input name="notes" maxlength="250" placeholder="Voucher terms or details"></div>`,'Issue voucher',async fd=>{const payload={member_id:m.id,code:String(fd.get('code')).trim().toUpperCase(),reward:String(fd.get('reward')).trim(),expiry_date:fd.get('expiry_date')||null,notes:String(fd.get('notes')||'').trim()||null,status:'Active'};const {error}=await client.from('vouchers').insert(payload);if(error)throw error;msg('Voucher issued.','success');await loadAll();return true})}
+async function markVoucherUsed(id){if(!confirm('Mark this voucher as used? This cannot be undone from this button.'))return;const {error}=await client.from('vouchers').update({status:'Used',used_at:new Date().toISOString()}).eq('id',id).eq('status','Active');if(error){msg(error.message,'error');return}msg('Voucher marked as used.','success');await loadAll()}
+$('addMemberBtn').addEventListener('click',()=>openMemberModal());boot();
+</script></body></html>
